@@ -1,0 +1,32 @@
+# Virtualenv (packages installed locally per README)
+.venv/
+
+# Downloaded audio / output
+downloads/
+*.mp3
+*.m4a
+*.aac
+*.opus
+*.ogg
+*.flac
+*.wav
+*.webm
+*.mp4
+*.jpg
+*.webp
+*.info.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Auth / secrets
+cookies.txt
+*.cookies
