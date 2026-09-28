@@ -36,6 +36,19 @@ def check_ffmpeg() -> None:
         sys.exit("ERROR: ffmpeg not found. Install it (e.g. sudo apt install ffmpeg) — yt-dlp needs it for mp3/m4a conversion.")
 
 
+def pick_js_runtime() -> dict | None:
+    """Return a js_runtimes dict for yt-dlp, preferring deno, falling back to node.
+
+    Without a JS runtime yt-dlp warns that "some formats may be missing",
+    which makes some tracks fail while others succeed.
+    """
+    if shutil.which("deno"):
+        return {"deno": {}}
+    if shutil.which("node"):
+        return {"node": {}}
+    return None
+
+
 def build_opts(args: argparse.Namespace, download_dir: Path) -> dict:
     outtmpl = {
         "default": str(download_dir / "%(title)s [%(id)s].%(ext)s"),
@@ -78,7 +91,14 @@ def build_opts(args: argparse.Namespace, download_dir: Path) -> dict:
         "nocheckcertificate": False,
         "prefer_ffmpeg": True,
         "keepvideo": False,
+        # Re-running the same command skips tracks already on disk,
+        # so missing/failed tracks can be retried without re-downloading.
+        "nooverwrites": True,
     }
+
+    js_runtime = pick_js_runtime()
+    if js_runtime:
+        opts["js_runtimes"] = js_runtime
 
     if args.playlist_start is not None:
         opts["playliststart"] = args.playlist_start
@@ -172,6 +192,16 @@ def main(argv: list[str] | None = None) -> int:
         print("Mode   : full playlist/album (use --no-playlist for single video only)")
 
     failures = 0
+    failed_tracks: list[str] = []
+
+    def progress_hook(d: dict) -> None:
+        # Called per track with status "downloading" / "finished" / "error".
+        if d.get("status") == "error":
+            info = d.get("info_dict") or {}
+            failed_tracks.append(info.get("title") or info.get("id") or "unknown")
+
+    opts["progress_hooks"] = [progress_hook]
+
     with YoutubeDL(opts) as ydl:
         for url in args.urls:
             try:
@@ -193,6 +223,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nDone — {len(new_files)} track(s):")
     for f in new_files:
         print(f"  • {f.relative_to(download_dir)}")
+
+    if failed_tracks:
+        print(f"\n{len(failed_tracks)} track(s) FAILED (often transient YouTube throttling/bot-check):", file=sys.stderr)
+        for t in failed_tracks:
+            print(f"  ✗ {t}", file=sys.stderr)
+        print(
+            "\nHint: just re-run the same command — tracks already on disk are skipped.\n"
+            "If failures persist with 'Sign in to confirm you're not a bot', pass --cookies cookies.txt.",
+            file=sys.stderr,
+        )
 
     # Optional --album-name rename: if exactly one new top-level folder appeared, rename it.
     if args.album_name:
@@ -227,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                     t.unlink(missing_ok=True)
                 print("  (per-track files removed — --whole-only)")
 
-    return 0 if failures == 0 else 2
+    return 0 if (failures == 0 and not failed_tracks) else 2
 
 
 if __name__ == "__main__":

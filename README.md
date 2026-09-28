@@ -90,3 +90,5 @@ Cover art and metadata/chapters are embedded by default.
 - `ERROR: ffmpeg not found` → install ffmpeg (`sudo apt install ffmpeg`).
 - `Sign in to confirm you're not a bot` / age-restricted video → export a `cookies.txt` from your browser (e.g. with the "Get cookies.txt LOCALLY" extension) and pass `--cookies cookies.txt`.
 - Nothing downloaded → the video may be private/deleted/region-blocked; remove `--quiet` to see per-track warnings.
+- Fewer tracks than expected (e.g. 7 of 24) → usually transient YouTube throttling/bot-checks on some tracks. The script now lists exactly which tracks failed at the end. Just **re-run the same command** — tracks already on disk are skipped, only the missing ones are retried. If the same tracks keep failing, retry later or use `--cookies cookies.txt`.
+- `No supported JavaScript runtime` warning → the script auto-uses `deno` or `node` if found on `PATH`. Without one, yt-dlp may miss formats and some tracks can fail; install deno (`https://deno.com`) or nodejs to avoid this.
