@@ -27,6 +27,7 @@ from pathlib import Path
 
 try:
     from yt_dlp import YoutubeDL
+    from yt_dlp.utils import sanitize_filename
 except ImportError:
     sys.exit("ERROR: yt-dlp not found. Run: ./.venv/bin/pip install yt-dlp mutagen")
 
@@ -49,11 +50,43 @@ def pick_js_runtime() -> dict | None:
     return None
 
 
-def build_opts(args: argparse.Namespace, download_dir: Path) -> dict:
-    outtmpl = {
-        "default": str(download_dir / "%(title)s [%(id)s].%(ext)s"),
-        "playlist": str(download_dir / "%(playlist_title)s" / "%(playlist_index)02d - %(title)s [%(id)s].%(ext)s"),
+def probe_url(url: str, args: argparse.Namespace) -> tuple[str | None, int | None]:
+    """Lightweight probe: return (album_folder or None, expected track count or None).
+
+    Playlists/albums get their own folder (from --album-name or the playlist
+    title). Singles return None (= top level of the output dir).
+    Returns (None, None) if probing itself fails — the download still proceeds.
+    """
+    probe_opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "ignoreerrors": True,
     }
+    if args.playlist_start is not None:
+        probe_opts["playliststart"] = args.playlist_start
+    if args.playlist_end is not None:
+        probe_opts["playlistend"] = args.playlist_end
+    if args.cookies:
+        probe_opts["cookiefile"] = str(args.cookies)
+    try:
+        with YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:
+        return None, None
+    if not info or info.get("_type") != "playlist" or args.no_playlist:
+        return None, 1
+    entries = [e for e in (info.get("entries") or []) if e]
+    folder = sanitize_filename(args.album_name or info.get("title") or "playlist")
+    return folder, len(entries)
+
+
+def build_opts(args: argparse.Namespace, download_dir: Path, subfolder: str | None = None) -> dict:
+    if subfolder:
+        outtmpl = str(download_dir / subfolder / "%(playlist_index)02d - %(title)s [%(id)s].%(ext)s")
+    else:
+        outtmpl = str(download_dir / "%(title)s [%(id)s].%(ext)s")
 
     postprocessors = [
         {
@@ -179,11 +212,6 @@ def main(argv: list[str] | None = None) -> int:
 
     download_dir = Path(args.out).expanduser().resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
-    before = set(download_dir.rglob("*"))
-
-    # If --album-name given and downloading a playlist, pre-route output into that folder.
-    # We do this by post-hoc rename: simpler = download normally, then rename playlist folder.
-    opts = build_opts(args, download_dir)
 
     print(f"Output : {download_dir}")
     print(f"Format : {args.format} (quality {args.quality})")
@@ -193,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
 
     failures = 0
     failed_tracks: list[str] = []
+    all_new_files: list[Path] = []
 
     def progress_hook(d: dict) -> None:
         # Called per track with status "downloading" / "finished" / "error".
@@ -200,21 +229,44 @@ def main(argv: list[str] | None = None) -> int:
             info = d.get("info_dict") or {}
             failed_tracks.append(info.get("title") or info.get("id") or "unknown")
 
-    opts["progress_hooks"] = [progress_hook]
+    for url in args.urls:
+        folder, expected = probe_url(url, args)
+        if folder:
+            if expected:
+                print(f"\n▶ Album: {folder} ({expected} tracks)\n  {url}")
+            else:
+                print(f"\n▶ Album: {folder}\n  {url}")
+        else:
+            print(f"\n▶ {url}")
 
-    with YoutubeDL(opts) as ydl:
-        for url in args.urls:
-            try:
-                print(f"\n▶ {url}")
+        snapshot = set(download_dir.rglob("*"))
+        opts = build_opts(args, download_dir, subfolder=folder)
+        opts["progress_hooks"] = [progress_hook]
+        try:
+            with YoutubeDL(opts) as ydl:
                 ydl.download([url])
-            except Exception as e:  # noqa: BLE001 — report and continue with next URL
-                failures += 1
-                print(f"  FAILED: {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — report and continue with next URL
+            failures += 1
+            print(f"  FAILED: {e}", file=sys.stderr)
 
-    new_files = collect_audio_files(download_dir, args.format if args.format != "best" else "best", before)
-    # collect_audio_files with 'best' matches many exts; handle that case
-    if args.format == "best":
-        new_files = sorted((p for p in download_dir.rglob("*") if p.is_file() and p not in before), key=lambda p: p.name)
+        new_files = collect_audio_files(
+            download_dir, args.format if args.format != "best" else "best", snapshot
+        )
+        if args.format == "best":
+            new_files = sorted(
+                (p for p in download_dir.rglob("*") if p.is_file() and p not in snapshot),
+                key=lambda p: p.name,
+            )
+        all_new_files.extend(new_files)
+
+        if folder:
+            label = f"Album '{folder}'"
+            if expected:
+                print(f"\n{label}: downloaded {len(new_files)} of {expected} track(s)")
+            else:
+                print(f"\n{label}: downloaded {len(new_files)} track(s)")
+
+    new_files = sorted(all_new_files, key=lambda p: p.name)
 
     if not new_files:
         print("\nNo new audio files were downloaded (check URLs / warnings above).", file=sys.stderr)
@@ -233,17 +285,6 @@ def main(argv: list[str] | None = None) -> int:
             "If failures persist with 'Sign in to confirm you're not a bot', pass --cookies cookies.txt.",
             file=sys.stderr,
         )
-
-    # Optional --album-name rename: if exactly one new top-level folder appeared, rename it.
-    if args.album_name:
-        top_dirs = {f.relative_to(download_dir).parts[0] for f in new_files if len(f.relative_to(download_dir).parts) > 1}
-        if len(top_dirs) == 1:
-            src = download_dir / next(iter(top_dirs))
-            dst = download_dir / args.album_name
-            if src != dst and not dst.exists():
-                src.rename(dst)
-                print(f"\nRenamed album folder:\n  {src.name} -> {dst.name}")
-                new_files = sorted(dst.rglob(f"*.{args.format}") if args.format != "best" else dst.rglob("*"))
 
     # Optional: merge whole album into one file
     if args.whole or args.whole_only:
