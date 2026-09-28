@@ -48,10 +48,9 @@ def build_opts(args: argparse.Namespace, download_dir: Path) -> dict:
             "preferredcodec": args.format,
             **({"preferredquality": str(args.quality)} if args.format in ("mp3", "m4a", "aac", "opus", "vorbis") else {}),
         },
-        {"key": "FFmpegMetadataFromChapters"},
     ]
     if args.embed_metadata:
-        postprocessors.append({"key": "FFmpegMetadata"})
+        postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
     if args.embed_thumbnail:
         postprocessors.append({"key": "EmbedThumbnail"})
         # EmbedThumbnail requires atomicparsley fallback off; modern ffmpeg is fine.
