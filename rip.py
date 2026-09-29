@@ -19,10 +19,12 @@ Requires: .venv with yt-dlp, system ffmpeg.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -50,11 +52,28 @@ def pick_js_runtime() -> dict | None:
     return None
 
 
-def probe_url(url: str, args: argparse.Namespace) -> tuple[str | None, int | None]:
-    """Lightweight probe: return (album_folder or None, expected track count or None).
+SEARCH_PREFIX_RE = re.compile(r"^\w+search\d*:", re.IGNORECASE)
+
+AUDIO_EXTS = ("mp3", "m4a", "aac", "opus", "ogg", "vorbis", "flac", "wav", "webm", "mp4")
+
+
+def normalize_url(raw: str, args: argparse.Namespace) -> tuple[str, str | None]:
+    """Return (url_to_download, search_term_or_None).
+
+    Bare words (no URL scheme / search prefix) become a YouTube search for the
+    top --search results, so `rip.py never gonna give you up` just works.
+    """
+    raw = raw.strip()
+    if "://" in raw or SEARCH_PREFIX_RE.match(raw):
+        return raw, None
+    return f"ytsearch{args.search}:{raw}", raw
+
+
+def probe_url(url: str, args: argparse.Namespace) -> tuple[str | None, list[tuple[str, str | None]] | None]:
+    """Lightweight probe: return (album_folder or None, [(video_id, title)] or None).
 
     Playlists/albums get their own folder (from --album-name or the playlist
-    title). Singles return None (= top level of the output dir).
+    title). Singles return None (= top level of the output dir) with one entry.
     Returns (None, None) if probing itself fails — the download still proceeds.
     """
     probe_opts: dict = {
@@ -64,6 +83,8 @@ def probe_url(url: str, args: argparse.Namespace) -> tuple[str | None, int | Non
         "skip_download": True,
         "ignoreerrors": True,
     }
+    if args.no_playlist:
+        probe_opts["noplaylist"] = True
     if args.playlist_start is not None:
         probe_opts["playliststart"] = args.playlist_start
     if args.playlist_end is not None:
@@ -75,11 +96,32 @@ def probe_url(url: str, args: argparse.Namespace) -> tuple[str | None, int | Non
             info = ydl.extract_info(url, download=False)
     except Exception:
         return None, None
-    if not info or info.get("_type") != "playlist" or args.no_playlist:
-        return None, 1
-    entries = [e for e in (info.get("entries") or []) if e]
-    folder = sanitize_filename(args.album_name or info.get("title") or "playlist")
-    return folder, len(entries)
+    if not info:
+        return None, None
+    if info.get("_type") == "playlist" and not args.no_playlist:
+        entries = [
+            (e.get("id", ""), e.get("title"))
+            for e in (info.get("entries") or [])
+            if e and e.get("id")
+        ]
+        folder = sanitize_filename(args.album_name or info.get("title") or "playlist")
+        return folder, entries
+    if info.get("id"):
+        return None, [(info["id"], info.get("title"))]
+    return None, None
+
+
+def find_missing_tracks(
+    target_dir: Path, wanted: list[tuple[str, str | None]], fmt: str
+) -> list[tuple[str, str | None]]:
+    """Which wanted (video_id, title) pairs have no audio file on disk yet."""
+    exts = (fmt,) if fmt != "best" else AUDIO_EXTS
+    have = {p.name for p in target_dir.rglob("*") if p.is_file()}
+    return [
+        (vid, title)
+        for vid, title in wanted
+        if not any(name.endswith(f"[{vid}].{ext}") for ext in exts for name in have)
+    ]
 
 
 def build_opts(args: argparse.Namespace, download_dir: Path, subfolder: str | None = None) -> dict:
@@ -186,16 +228,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Rip audio from YouTube video / playlist / YouTube Music album. Playlists download as a whole album folder.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("urls", nargs="+", help="One or more YouTube video / playlist / music.youtube.com album URLs (or ytsearch queries).")
+    p.add_argument("urls", nargs="+", help="URLs and/or bare search terms (e.g. \"lofi hip hop mix\"). Bare terms search YouTube for the top --search results.")
     p.add_argument("-o", "--out", default="downloads", help="Output directory.")
     p.add_argument("-f", "--format", default="mp3", choices=["mp3", "m4a", "aac", "opus", "vorbis", "flac", "wav", "best"], help="Audio container/codec.")
     p.add_argument("-q", "--quality", default="0", help="Audio quality for lossy codecs (0=best … 10=worst for mp3/vorbis; bitrate like 192K also accepted).")
+    p.add_argument("-s", "--search", type=int, default=1, help="How many top results to rip per bare search term.")
     p.add_argument("--album-name", default=None, help="Force album folder name for playlists (default: playlist title).")
     p.add_argument("--whole", action="store_true", help="Merge the whole playlist/album into ONE single audio file (in addition to per-track files). Needs ffmpeg.")
     p.add_argument("--whole-only", action="store_true", help="Only keep the merged single file; delete per-track files after merging.")
     p.add_argument("--no-playlist", action="store_true", help="Download only the single video even if URL is a playlist.")
     p.add_argument("--start", dest="playlist_start", type=int, default=None, help="Playlist start index (1-based).")
     p.add_argument("--end", dest="playlist_end", type=int, default=None, help="Playlist end index (inclusive).")
+    p.add_argument("--retry", type=int, default=2, help="Extra passes over missing/failed tracks (with backoff). 0 = single pass.")
+    p.add_argument("--retry-wait", type=int, default=15, help="Base wait in seconds between retry passes (multiplied by attempt number).")
     p.add_argument("--jobs", type=int, default=4, help="Concurrent fragment downloads.")
     p.add_argument("--cookies", default=None, help="Path to cookies.txt (needed for age-restricted / private videos).")
     p.add_argument("--user-agent", default=None, help="Custom User-Agent string.")
@@ -220,68 +265,104 @@ def main(argv: list[str] | None = None) -> int:
         print("Mode   : full playlist/album (use --no-playlist for single video only)")
 
     failures = 0
-    failed_tracks: list[str] = []
+    still_missing: list[tuple[str, str, str | None]] = []  # (album label, video id, title)
     all_new_files: list[Path] = []
+    fmt = args.format if args.format != "best" else "best"
 
-    def progress_hook(d: dict) -> None:
-        # Called per track with status "downloading" / "finished" / "error".
-        if d.get("status") == "error":
-            info = d.get("info_dict") or {}
-            failed_tracks.append(info.get("title") or info.get("id") or "unknown")
+    for raw in args.urls:
+        url, search_term = normalize_url(raw, args)
+        folder, wanted = probe_url(url, args)
+        if search_term and folder and not args.album_name:
+            folder = sanitize_filename(f"search - {search_term}")
+        target = download_dir / folder if folder else download_dir
 
-    for url in args.urls:
-        folder, expected = probe_url(url, args)
         if folder:
-            if expected:
-                print(f"\n▶ Album: {folder} ({expected} tracks)\n  {url}")
+            total = f" ({len(wanted)} tracks)" if wanted else ""
+            if search_term:
+                print(f'\n▶ Search: "{search_term}" → album folder: {folder}{total}\n  {url}')
             else:
-                print(f"\n▶ Album: {folder}\n  {url}")
+                print(f"\n▶ Album: {folder}{total}\n  {url}")
+        elif search_term:
+            print(f'\n▶ Search: "{search_term}"\n  {url}')
         else:
             print(f"\n▶ {url}")
 
-        snapshot = set(download_dir.rglob("*"))
-        opts = build_opts(args, download_dir, subfolder=folder)
-        opts["progress_hooks"] = [progress_hook]
-        try:
-            with YoutubeDL(opts) as ydl:
-                ydl.download([url])
-        except Exception as e:  # noqa: BLE001 — report and continue with next URL
-            failures += 1
-            print(f"  FAILED: {e}", file=sys.stderr)
+        missing = list(wanted) if wanted else []
+        max_attempts = 1 + max(0, args.retry)
+        exts = (fmt,) if fmt != "best" else AUDIO_EXTS
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                wait = args.retry_wait * attempt
+                print(f"\nRetry pass {attempt + 1}/{max_attempts}: {len(missing)} track(s) still missing — waiting {wait}s...")
+                time.sleep(wait)
+            snapshot = set(download_dir.rglob("*"))
+            hook_errors: list[str] = []
 
-        new_files = collect_audio_files(
-            download_dir, args.format if args.format != "best" else "best", snapshot
-        )
-        if args.format == "best":
-            new_files = sorted(
-                (p for p in download_dir.rglob("*") if p.is_file() and p not in snapshot),
-                key=lambda p: p.name,
-            )
-        all_new_files.extend(new_files)
+            def progress_hook(d: dict) -> None:
+                # Called per track with status "downloading" / "finished" / "error".
+                if d.get("status") == "error":
+                    info = d.get("info_dict") or {}
+                    hook_errors.append(info.get("title") or info.get("id") or "unknown")
+
+            opts = build_opts(args, download_dir, subfolder=folder)
+            opts["progress_hooks"] = [progress_hook]
+            try:
+                with YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            except Exception as e:  # noqa: BLE001 — report and continue with next URL
+                failures += 1
+                print(f"  FAILED: {e}", file=sys.stderr)
+
+            new_files = collect_audio_files(download_dir, fmt, snapshot)
+            if args.format == "best":
+                new_files = sorted(
+                    (p for p in download_dir.rglob("*") if p.is_file() and p not in snapshot),
+                    key=lambda p: p.name,
+                )
+            all_new_files.extend(new_files)
+
+            if wanted:
+                missing = find_missing_tracks(target, wanted, fmt)
+            else:
+                # Probe gave no track list: retry only if this pass errored
+                # or produced nothing new while the target has no audio at all.
+                audio_present = any(
+                    p.is_file() and p.suffix.lower().lstrip(".") in exts
+                    for p in target.rglob("*")
+                )
+                if hook_errors or (not new_files and not audio_present):
+                    missing = [("unknown", None)]
+                else:
+                    missing = []
+            if not missing:
+                break
 
         if folder:
             label = f"Album '{folder}'"
-            if expected:
-                print(f"\n{label}: downloaded {len(new_files)} of {expected} track(s)")
+            if wanted:
+                print(f"\n{label}: downloaded {len(wanted) - len(missing)} of {len(wanted)} track(s)")
             else:
                 print(f"\n{label}: downloaded {len(new_files)} track(s)")
+        if missing:
+            label = folder or "singles"
+            still_missing.extend((label, vid, title) for vid, title in missing)
 
     new_files = sorted(all_new_files, key=lambda p: p.name)
 
     if not new_files:
         print("\nNo new audio files were downloaded (check URLs / warnings above).", file=sys.stderr)
-        return 1 if failures else 0
+        return 2 if (failures or still_missing) else 0
 
     print(f"\nDone — {len(new_files)} track(s):")
     for f in new_files:
         print(f"  • {f.relative_to(download_dir)}")
 
-    if failed_tracks:
-        print(f"\n{len(failed_tracks)} track(s) FAILED (often transient YouTube throttling/bot-check):", file=sys.stderr)
-        for t in failed_tracks:
-            print(f"  ✗ {t}", file=sys.stderr)
+    if still_missing:
+        print(f"\n{len(still_missing)} track(s) still missing after retries:", file=sys.stderr)
+        for label, vid, title in still_missing:
+            print(f"  ✗ [{label}] {title or vid} ({vid})", file=sys.stderr)
         print(
-            "\nHint: just re-run the same command — tracks already on disk are skipped.\n"
+            "\nHint: failures are often transient YouTube throttling/bot-checks — re-run later.\n"
             "If failures persist with 'Sign in to confirm you're not a bot', pass --cookies cookies.txt.",
             file=sys.stderr,
         )
@@ -308,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                     t.unlink(missing_ok=True)
                 print("  (per-track files removed — --whole-only)")
 
-    return 0 if (failures == 0 and not failed_tracks) else 2
+    return 0 if (failures == 0 and not still_missing) else 2
 
 
 if __name__ == "__main__":

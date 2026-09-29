@@ -24,7 +24,13 @@ ffmpeg -version
 Always run with the venv Python:
 
 ```bash
-./.venv/bin/python rip.py <URL> [URL ...] [options]
+./.venv/bin/python rip.py <URL-or-search> [URL-or-search ...] [options]
+```
+
+Bare words are treated as a YouTube search (no URL needed):
+
+```bash
+./.venv/bin/python rip.py "lofi hip hop mix"
 ```
 
 ### Examples
@@ -50,6 +56,15 @@ Always run with the venv Python:
 
 # Partial playlist, different folder, quiet
 ./.venv/bin/python rip.py "https://www.youtube.com/playlist?list=PLAYLIST_ID" --start 3 --end 7 -o ~/Music --quiet
+
+# No URL needed — search YouTube and rip the top result
+./.venv/bin/python rip.py "C418 Sweden minecraft"
+
+# Search and rip the top 3 results into a "search - ..." folder
+./.venv/bin/python rip.py "synthwave mix" --search 3
+
+# Disable automatic retries (single pass only)
+./.venv/bin/python rip.py "https://www.youtube.com/playlist?list=PLAYLIST_ID" --retry 0
 ```
 
 ## Options
@@ -59,6 +74,9 @@ Always run with the venv Python:
 | `-o, --out` | `downloads` | Output directory |
 | `-f, --format` | `mp3` | `mp3`, `m4a`, `aac`, `opus`, `vorbis`, `flac`, `wav`, `best` |
 | `-q, --quality` | `0` | Lossy quality (`0`=best … `10`=worst; bitrate like `192K` also works) |
+| `-s, --search` | `1` | Top results to rip per bare search term |
+| `--retry` | `2` | Extra passes over missing/failed tracks, with backoff (`0` = single pass) |
+| `--retry-wait` | `15` | Base wait in seconds between retry passes (× attempt number) |
 | `--album-name` | playlist title | Force album folder name |
 | `--whole` | off | Also merge playlist/album into one `(full album)` file |
 | `--whole-only` | off | Keep only the merged file, delete per-track files |
@@ -81,6 +99,7 @@ downloads/
     01 - Track One [id1].mp3
     02 - Track Two [id2].mp3
     Some Playlist (full album).mp3         # only with --whole / --whole-only
+  search - lofi hip hop mix/               # bare search terms land here too
 ```
 
 Cover art and metadata/chapters are embedded by default.
@@ -90,5 +109,5 @@ Cover art and metadata/chapters are embedded by default.
 - `ERROR: ffmpeg not found` → install ffmpeg (`sudo apt install ffmpeg`).
 - `Sign in to confirm you're not a bot` / age-restricted video → export a `cookies.txt` from your browser (e.g. with the "Get cookies.txt LOCALLY" extension) and pass `--cookies cookies.txt`.
 - Nothing downloaded → the video may be private/deleted/region-blocked; remove `--quiet` to see per-track warnings.
-- Fewer tracks than expected (e.g. 7 of 24) → usually transient YouTube throttling/bot-checks on some tracks. The script now lists exactly which tracks failed at the end. Just **re-run the same command** — tracks already on disk are skipped, only the missing ones are retried. If the same tracks keep failing, retry later or use `--cookies cookies.txt`.
+- Fewer tracks than expected (e.g. 7 of 24) → usually transient YouTube throttling/bot-checks on some tracks. The script retries missing tracks automatically (`--retry`, default 2 extra passes with backoff) and lists anything still missing at the end with `✗`. If tracks remain missing, wait a while and re-run (already-downloaded tracks are skipped), or pass `--cookies cookies.txt`.
 - `No supported JavaScript runtime` warning → the script auto-uses `deno` or `node` if found on `PATH`. Without one, yt-dlp may miss formats and some tracks can fail; install deno (`https://deno.com`) or nodejs to avoid this.
