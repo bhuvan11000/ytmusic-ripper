@@ -187,6 +187,64 @@ def build_opts(args: argparse.Namespace, download_dir: Path, subfolder: str | No
     return opts
 
 
+TRACK_PREFIX_RE = re.compile(r"^(\d+)\s*-\s*")
+
+
+def tag_track_numbers(files: list[Path]) -> tuple[int, int]:
+    """Write NN filename prefixes (e.g. '09 - Title.mp3') into tracknumber tags.
+
+    YouTube provides no track numbers, so yt-dlp can't embed them — without
+    this, players (e.g. Navidrome) order album tracks alphabetically.
+    Returns (tagged, failed). Supports mp3/m4a/flac/opus/ogg.
+    """
+    from mutagen.easyid3 import EasyID3
+    from mutagen.flac import FLAC
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+
+    tagged, failed = 0, 0
+    for f in files:
+        m = TRACK_PREFIX_RE.match(f.name)
+        if not m:
+            continue  # singles have no NN prefix — nothing to write
+        num = int(m.group(1))
+        try:
+            ext = f.suffix.lower()
+            if ext == ".mp3":
+                audio = EasyID3(str(f))
+                if audio.get("tracknumber") == [str(num)]:
+                    continue
+                audio["tracknumber"] = str(num)
+                audio.save()
+            elif ext in (".m4a", ".aac"):
+                audio = MP4(str(f))
+                total = audio.tags.get("trkn", [(0, 0)])[0][1] if audio.tags else 0
+                if audio.tags and audio.tags.get("trkn") == [(num, total)]:
+                    continue
+                audio["trkn"] = [(num, total)]
+                audio.save()
+            elif ext == ".flac":
+                audio = FLAC(str(f))
+                if audio.get("tracknumber") == [str(num)]:
+                    continue
+                audio["tracknumber"] = str(num)
+                audio.save()
+            elif ext in (".opus", ".ogg"):
+                audio = (OggOpus if ext == ".opus" else OggVorbis)(str(f))
+                if audio.get("tracknumber") == [str(num)]:
+                    continue
+                audio["tracknumber"] = str(num)
+                audio.save()
+            else:
+                continue
+            tagged += 1
+        except Exception as e:  # noqa: BLE001 — report and continue with next file
+            failed += 1
+            print(f"  Could not tag track number for {f.name}: {e}", file=sys.stderr)
+    return tagged, failed
+
+
 def merge_to_single_file(track_files: list[Path], output_file: Path, fmt: str) -> Path:
     """Concat downloaded tracks (in order) into one file via ffmpeg. Re-encodes to keep it simple/robust."""
     output_file = output_file.with_suffix(f".{fmt}")
@@ -267,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     failures = 0
     still_missing: list[tuple[str, str, str | None]] = []  # (album label, video id, title)
     all_new_files: list[Path] = []
+    touched_dirs: set[Path] = set()
     fmt = args.format if args.format != "best" else "best"
 
     for raw in args.urls:
@@ -275,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         if search_term and folder and not args.album_name:
             folder = sanitize_filename(f"search - {search_term}")
         target = download_dir / folder if folder else download_dir
+        if folder:
+            touched_dirs.add(target)
 
         if folder:
             total = f" ({len(wanted)} tracks)" if wanted else ""
@@ -348,6 +409,24 @@ def main(argv: list[str] | None = None) -> int:
             still_missing.extend((label, vid, title) for vid, title in missing)
 
     new_files = sorted(all_new_files, key=lambda p: p.name)
+
+    if args.embed_metadata:
+        # YouTube has no track numbers: copy the NN filename prefix into tags
+        # so players (e.g. Navidrome) order album tracks correctly. Covers the
+        # whole album folder, so tracks from earlier runs get tagged too.
+        exts = (fmt,) if fmt != "best" else AUDIO_EXTS
+        to_tag = sorted(
+            {
+                p
+                for d in touched_dirs
+                for p in d.rglob("*")
+                if p.is_file() and p.suffix.lower().lstrip(".") in exts
+            }
+        )
+        tagged, tag_failed = tag_track_numbers(to_tag)
+        if tagged:
+            print(f"\nTagged track numbers on {tagged} file(s).")
+        failures += tag_failed
 
     if not new_files:
         print("\nNo new audio files were downloaded (check URLs / warnings above).", file=sys.stderr)

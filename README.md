@@ -102,7 +102,7 @@ downloads/
   search - lofi hip hop mix/               # bare search terms land here too
 ```
 
-Cover art and metadata/chapters are embedded by default.
+Cover art and metadata/chapters are embedded by default. Track numbers aren't provided by YouTube, so the script copies each file's `NN -` filename prefix into its `tracknumber` tag (mp3/m4a/flac/opus/ogg) — album tracks then sort correctly in players like Navidrome. Pass `--no-embed-metadata` to skip all tagging.
 
 ## Troubleshooting
 
