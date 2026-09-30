@@ -428,6 +428,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nTagged track numbers on {tagged} file(s).")
         failures += tag_failed
 
+    if args.embed_thumbnail:
+        # yt-dlp leaves the playlist artwork as "00 - <album> [...].jpg":
+        # rename it to cover.jpg. Never overwrites an existing cover.jpg.
+        for d in sorted(touched_dirs):
+            if (d / "cover.jpg").exists():
+                continue
+            leftovers = sorted(
+                (p for p in d.iterdir() if p.is_file() and p.name.startswith("00 - ")),
+                key=lambda p: p.stat().st_size,
+                reverse=True,
+            )
+            if leftovers:
+                leftovers[0].rename(d / "cover.jpg")
+                print(f"\nRenamed '{leftovers[0].name}' to 'cover.jpg'.")
+
     if not new_files:
         print("\nNo new audio files were downloaded (check URLs / warnings above).", file=sys.stderr)
         return 2 if (failures or still_missing) else 0

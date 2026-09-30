@@ -102,7 +102,7 @@ downloads/
   search - lofi hip hop mix/               # bare search terms land here too
 ```
 
-Cover art and metadata/chapters are embedded by default. Track numbers aren't provided by YouTube, so the script copies each file's `NN -` filename prefix into its `tracknumber` tag (mp3/m4a/flac/opus/ogg) — album tracks then sort correctly in players like Navidrome. Pass `--no-embed-metadata` to skip all tagging.
+Cover art and metadata/chapters are embedded by default. The leftover playlist artwork file (`00 - <album> [...].jpg`) is renamed to `cover.jpg` in each album folder (an existing `cover.jpg` is never overwritten; `--no-embed-thumbnail` skips this). Track numbers aren't provided by YouTube, so the script copies each file's `NN -` filename prefix into its `tracknumber` tag (mp3/m4a/flac/opus/ogg) — album tracks then sort correctly in players like Navidrome. Pass `--no-embed-metadata` to skip all tagging.
 
 ## Troubleshooting
 
